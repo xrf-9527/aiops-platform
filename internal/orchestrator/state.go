@@ -167,11 +167,49 @@ type OrchestratorState struct {
 	Failed        map[IssueID]FailedEntry
 	Completed     map[IssueID]struct{} // bookkeeping only per SPEC §4.1.8
 
+	// completedOrder and failedOrder pin FIFO insertion order so the
+	// cap-and-evict policy below has a deterministic "oldest" to drop
+	// and Snapshot() can publish entries in observed-order. They
+	// mirror Completed / Failed: every id present in the set is also
+	// in the slice, and vice versa.
+	completedOrder []IssueID
+	failedOrder    []IssueID
+
+	// MaxRecentCompleted / MaxRecentFailed cap how many entries the
+	// orchestrator retains in Completed / Failed for /api/v1/state
+	// publication. SPEC §4.1.8 marks Completed as "bookkeeping only,
+	// not dispatch gating" — long-running deployments (#234) were
+	// otherwise accumulating tens of thousands of IDs in memory and
+	// serializing them on every snapshot. Zero means "no cap"
+	// (preserves the prior unbounded behavior for callers that opt
+	// out), but NewOrchestratorState sets DefaultMaxRecentCompleted /
+	// DefaultMaxRecentFailed so the bounded behavior is the default.
+	MaxRecentCompleted int
+	MaxRecentFailed    int
+
+	// CumulativeCompletedTotal / CumulativeFailedTotal are monotonic
+	// counters of every Completed / Failed transition observed since
+	// process start. They survive cap-eviction and ReleaseFailed*
+	// removal, so operators can read a true lifetime total from
+	// /api/v1/state even when the per-id slices have been trimmed.
+	CumulativeCompletedTotal int64
+	CumulativeFailedTotal    int64
+
 	CodexTotals     CodexTotals
 	CodexRateLimits *RateLimitSnapshot // nil until the runner populates it
 
 	RecentEvents []RuntimeEvent
 }
+
+// DefaultMaxRecentCompleted / DefaultMaxRecentFailed cap the per-id
+// slices that /api/v1/state and Snapshot() publish. The cap is
+// applied at construction (NewOrchestratorState); transitions evict
+// the oldest entry when the cap is exceeded. Lifetime totals are
+// preserved via the cumulative counters.
+const (
+	DefaultMaxRecentCompleted = 1000
+	DefaultMaxRecentFailed    = 1000
+)
 
 // FailedEntry suppresses a deterministic non-retryable failure only while the
 // tracker issue is unchanged. A later tracker state/update change means a human
@@ -204,6 +242,8 @@ func NewOrchestratorState(pollIntervalMs int64, maxConcurrentAgents int) *Orches
 		RetryAttempts:              map[IssueID]*RetryEntry{},
 		Failed:                     map[IssueID]FailedEntry{},
 		Completed:                  map[IssueID]struct{}{},
+		MaxRecentCompleted:         DefaultMaxRecentCompleted,
+		MaxRecentFailed:            DefaultMaxRecentFailed,
 	}
 }
 
@@ -249,8 +289,82 @@ func (s *OrchestratorState) ReleaseFailedIfIssueChanged(issue tracker.Issue) boo
 	if failed.State == issue.State && failed.UpdatedAt == issue.UpdatedAt {
 		return false
 	}
-	delete(s.Failed, id)
+	s.removeFailed(id)
 	return true
+}
+
+// removeFailed deletes id from both Failed and failedOrder. The two
+// must stay in sync; release sites elsewhere also call this helper.
+// The cumulative counter (CumulativeFailedTotal) is unaffected: it
+// records observed transitions and is monotonic.
+func (s *OrchestratorState) removeFailed(id IssueID) {
+	if _, ok := s.Failed[id]; !ok {
+		return
+	}
+	delete(s.Failed, id)
+	for i, v := range s.failedOrder {
+		if v == id {
+			s.failedOrder = append(s.failedOrder[:i], s.failedOrder[i+1:]...)
+			return
+		}
+	}
+}
+
+// recordCompleted adds id to Completed + completedOrder, increments
+// CumulativeCompletedTotal, and trims the slice/map to
+// MaxRecentCompleted by evicting the oldest entry. A repeat call for
+// the same id is a no-op for the slice (FIFO position is preserved
+// from the first transition) but still increments the cumulative
+// counter — every observed succeeded transition is a real event.
+func (s *OrchestratorState) recordCompleted(id IssueID) {
+	s.CumulativeCompletedTotal++
+	if _, ok := s.Completed[id]; ok {
+		return
+	}
+	s.Completed[id] = struct{}{}
+	s.completedOrder = append(s.completedOrder, id)
+	if s.MaxRecentCompleted > 0 && len(s.completedOrder) > s.MaxRecentCompleted {
+		oldest := s.completedOrder[0]
+		s.completedOrder = s.completedOrder[1:]
+		delete(s.Completed, oldest)
+	}
+}
+
+// recordFailed inserts a non-retryable failure into the Failed map
+// and the recent-failed FIFO slice. Critically — unlike
+// recordCompleted — the Failed MAP is NEVER evicted: it's the source
+// of truth for IsClaimed's suppression check
+// (s.Failed[id]) that prevents redispatch of a deterministic failure
+// until ReleaseFailedIfIssueChanged sees a tracker state/updated_at
+// change. Evicting from the map would re-open the door to the spin
+// behavior the suppression contract exists to prevent (regression
+// caught on #234 review).
+//
+// Only the failedOrder SLICE is capped, because that slice is what
+// /api/v1/state publishes — operators see "the N most recently
+// failed" while the orchestrator still suppresses any id present in
+// the map, evicted-from-slice or not. The true currently-suppressed
+// count is reported via counts.failed = len(s.Failed); the bounded
+// per-id array is the FIFO slice.
+func (s *OrchestratorState) recordFailed(id IssueID, entry FailedEntry) {
+	s.CumulativeFailedTotal++
+	if _, ok := s.Failed[id]; ok {
+		// Refresh: update the entry but leave the FIFO position
+		// alone. Refresh is a normal flow when a tracker
+		// state/updated_at changes mid-cycle and a new failure is
+		// recorded before reconciliation rotates the entry out.
+		s.Failed[id] = entry
+		return
+	}
+	s.Failed[id] = entry
+	s.failedOrder = append(s.failedOrder, id)
+	if s.MaxRecentFailed > 0 && len(s.failedOrder) > s.MaxRecentFailed {
+		// Trim the recent-display slice only. The map keeps the entry
+		// so suppression survives the eviction; once
+		// ReleaseFailedIfIssueChanged or BeginDispatch removes the
+		// map entry, removeFailed clears whatever slot remains.
+		s.failedOrder = s.failedOrder[1:]
+	}
 }
 
 // RunningCount reports in-flight work that consumes agent concurrency. Claimed
@@ -345,7 +459,7 @@ func (s *OrchestratorState) BeginDispatch(id IssueID, entry *RunningEntry) {
 	s.Running[id] = entry
 	delete(s.Blocked, id)
 	delete(s.RetryAttempts, id)
-	delete(s.Failed, id)
+	s.removeFailed(id)
 }
 
 // FinishRunSucceeded is the transition for a worker that exited cleanly
@@ -366,7 +480,7 @@ func (s *OrchestratorState) FinishRunSucceeded(id IssueID, run *RunningEntry, el
 	delete(s.Running, id)
 	delete(s.Claimed, id)
 	delete(s.ClaimedIssues, id)
-	s.Completed[id] = struct{}{}
+	s.recordCompleted(id)
 	s.CodexTotals.AddSeconds(elapsed)
 	return true
 }
@@ -398,7 +512,7 @@ func (s *OrchestratorState) BlockRun(id IssueID, run *RunningEntry, blockedAt ti
 	}
 	delete(s.Running, id)
 	delete(s.RetryAttempts, id)
-	delete(s.Failed, id)
+	s.removeFailed(id)
 	s.Claimed[id] = struct{}{}
 	s.ClaimedIssues[id] = run.Issue
 	s.Blocked[id] = &BlockedEntry{
@@ -434,7 +548,7 @@ func (s *OrchestratorState) FinishRunNonRetryableFailed(id IssueID, run *Running
 	if !s.FinishRunFailed(id, run, elapsed) {
 		return false
 	}
-	s.Failed[id] = FailedEntry{State: run.Issue.State, UpdatedAt: run.Issue.UpdatedAt}
+	s.recordFailed(id, FailedEntry{State: run.Issue.State, UpdatedAt: run.Issue.UpdatedAt})
 	return true
 }
 
@@ -502,13 +616,30 @@ type StateView struct {
 	MaxConcurrentAgents        int
 	MaxConcurrentAgentsByState map[string]int
 
-	Running         []RunningView
-	Blocked         []BlockedView
-	Retrying        []RetryView
-	Failed          []IssueID
-	Completed       []IssueID
-	CodexTotals     CodexTotals
-	CodexRateLimits *RateLimitSnapshot
+	Running  []RunningView
+	Blocked  []BlockedView
+	Retrying []RetryView
+	// Failed and Completed are bounded by MaxRecentFailed /
+	// MaxRecentCompleted on the source state; the slices here are
+	// FIFO-ordered (oldest first). For lifetime totals that survive
+	// eviction, read CumulativeFailedTotal / CumulativeCompletedTotal.
+	Failed    []IssueID
+	Completed []IssueID
+	// FailedSuppressedCount is len(state.Failed) — the TRUE size of
+	// the dispatch-suppression set the orchestrator uses to block
+	// redispatch of deterministic failures (IsClaimed reads it). The
+	// `Failed` slice above is capped at MaxRecentFailed for display
+	// purposes; the suppression map is not capped (capping it would
+	// re-open redispatch on still-unfixed deterministic failures —
+	// see the carve-out in recordFailed). For ordinary deployments
+	// where ReleaseFailedIfIssueChanged keeps the set small, the two
+	// match; under sustained failure load, the count exceeds the
+	// slice length.
+	FailedSuppressedCount    int
+	CumulativeCompletedTotal int64
+	CumulativeFailedTotal    int64
+	CodexTotals              CodexTotals
+	CodexRateLimits          *RateLimitSnapshot
 }
 
 // RunningView is the per-running-entry projection in StateView. It
@@ -559,8 +690,11 @@ func (s *OrchestratorState) Snapshot() StateView {
 		Running:                    make([]RunningView, 0, len(s.Running)),
 		Blocked:                    make([]BlockedView, 0, len(s.Blocked)),
 		Retrying:                   make([]RetryView, 0, len(s.RetryAttempts)),
-		Failed:                     make([]IssueID, 0, len(s.Failed)),
-		Completed:                  make([]IssueID, 0, len(s.Completed)),
+		Failed:                     make([]IssueID, 0, len(s.failedOrder)),
+		Completed:                  make([]IssueID, 0, len(s.completedOrder)),
+		FailedSuppressedCount:      len(s.Failed),
+		CumulativeCompletedTotal:   s.CumulativeCompletedTotal,
+		CumulativeFailedTotal:      s.CumulativeFailedTotal,
 		CodexTotals:                s.CodexTotals,
 		CodexRateLimits:            copyRateLimitSnapshot(s.CodexRateLimits),
 	}
@@ -605,12 +739,12 @@ func (s *OrchestratorState) Snapshot() StateView {
 			Error:      r.Error,
 		})
 	}
-	for id := range s.Failed {
-		view.Failed = append(view.Failed, id)
-	}
-	for id := range s.Completed {
-		view.Completed = append(view.Completed, id)
-	}
+	// Iterate the FIFO order slices, not the map. The map's iteration
+	// order is undefined in Go; using the slices preserves observed
+	// insertion order so /api/v1/state consumers see "oldest first"
+	// stably, and the bounded slice matches MaxRecent* exactly.
+	view.Failed = append(view.Failed, s.failedOrder...)
+	view.Completed = append(view.Completed, s.completedOrder...)
 	return view
 }
 
