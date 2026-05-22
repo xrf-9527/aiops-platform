@@ -104,10 +104,14 @@ func HasFrontMatterAt(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	s := string(b)
-	if !strings.HasPrefix(s, "---\n") && !strings.HasPrefix(s, "---\r\n") {
-		return false, nil
-	}
-	trimmed := strings.TrimPrefix(strings.TrimPrefix(s, "---\r\n"), "---\n")
-	return strings.Contains(trimmed, "\n---"), nil
+	// Delegate to splitFrontMatter so the two functions cannot diverge
+	// on edge cases: a file that begins `---\n---\n...` has an opening
+	// and closing fence but no content between them, and the loader
+	// treats that case as prompt-only via
+	// `hasFrontMatter := strings.TrimSpace(front) != ""`. HasFrontMatterAt
+	// must report the same classification or the workflow_resolved
+	// event's `source` field disagrees with the actual Config that
+	// Load() produced.
+	front, _ := splitFrontMatter(string(b))
+	return strings.TrimSpace(front) != "", nil
 }
